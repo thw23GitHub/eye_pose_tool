@@ -17,7 +17,6 @@ void main() {
 }
 
 /// ★ 这里改成你自己的后端地址。
-/// 你现在是 10.215.237.32:8000，对吧。
 const String backendBaseUrl = 'http://10.215.237.32:8000';
 
 class EyePoseApp extends StatelessWidget {
@@ -60,7 +59,7 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
   String? _statusMessage;
   bool _isProcessing = false;
 
-  // slot -> index
+  // slot -> index（基线文档约定的 9 个位置）
   static const Map<String, int> _slotIndexMap = {
     'up_left': 0,
     'up': 1,
@@ -221,7 +220,7 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
 
                 const SizedBox(height: 16),
 
-                // C 区按钮
+                // C 区按钮 —— 按照基线文档：选择照片 / 处理照片 / 保存照片
                 const Text(
                   'C 区：操作按钮',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
@@ -247,6 +246,7 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
                     const SizedBox(width: 12),
                     Expanded(
                       child: _buildActionButton(
+                        // UI 文本保持为“保存照片”，背后做的是 B 区整体截图并保存
                         label: '保存照片',
                         onTap:
                         _isProcessing ? null : _saveProcessedGridAsImage,
@@ -393,8 +393,12 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
         return;
       }
 
+      // 新：更“听后端的话”
+      // 优先使用 grid_index，其次使用 slot，最后才顺序填充。
       final List<Uint8List?> newGrid =
       List<Uint8List?>.filled(9, null, growable: false);
+
+      int fallbackIndex = 0;
 
       for (final item in results) {
         if (item is! Map) continue;
@@ -402,14 +406,28 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
         final String? base64Str = item['image_base64'] as String?;
         if (base64Str == null || base64Str.isEmpty) continue;
 
-        final String? slot = item['slot'] as String?;
-        int index;
-        if (slot != null && _slotIndexMap.containsKey(slot)) {
-          index = _slotIndexMap[slot]!;
+        int? index;
+
+        // 1) grid_index（如果后端有这个字段，就完全按它来摆放）
+        final dynamic gridIndexRaw = item['grid_index'];
+        if (gridIndexRaw is int &&
+            gridIndexRaw >= 0 &&
+            gridIndexRaw < 9) {
+          index = gridIndexRaw;
         } else {
-          index = results.indexOf(item);
-          if (index < 0 || index >= 9) continue;
+          // 2) slot 字符串
+          final String? slot = item['slot'] as String?;
+          if (slot != null && _slotIndexMap.containsKey(slot)) {
+            index = _slotIndexMap[slot]!;
+          }
         }
+
+        // 3) 最后兜底：按 results 顺序依次填 0..8
+        while (index == null && fallbackIndex < 9 && newGrid[fallbackIndex] != null) {
+          fallbackIndex++;
+        }
+        index ??= (fallbackIndex < 9 ? fallbackIndex : null);
+        if (index == null || index < 0 || index >= 9) continue;
 
         try {
           final bytes = base64Decode(base64Str);
@@ -461,7 +479,7 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
     }
   }
 
-  // ===== 保存 B 区九宫格 =====
+  // ===== 保存 B 区九宫格（整体截图并保存为一张大图） =====
   Future<void> _saveProcessedGridAsImage() async {
     if (_processedGrid.every((b) => b == null)) {
       setState(() {
@@ -487,6 +505,7 @@ class _EyePoseHomePageState extends State<EyePoseHomePage> {
         return;
       }
 
+      // 把 B 区当前显示的九宫格整体截图成一张大图
       final ui.Image image =
       await boundary.toImage(pixelRatio: 3.0); // 提高导出清晰度
       final byteData =

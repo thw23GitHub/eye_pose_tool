@@ -1,275 +1,391 @@
+import io
 import base64
 import logging
-from typing import List, Optional
+from typing import List, Tuple, Dict, Optional
 
-import cv2
-import mediapipe as mp
+from flask import Flask, request, jsonify
+from werkzeug.utils import secure_filename
+
+from PIL import Image, ImageOps
 import numpy as np
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+import mediapipe as mp
 
-# ----------------- 基础配置 -----------------
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s:%(name)s:%(message)s",
-)
+# -------------------------
+# Flask 基础设置
+# -------------------------
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-app = Flask(__name__)
-CORS(app)
 
-# MediaPipe Face Mesh，全局实例
+# -------------------------
+# MediaPipe FaceMesh 初始化
+# -------------------------
 mp_face_mesh = mp.solutions.face_mesh
+
+# static_image_mode=True：单张图检测
+# refine_landmarks=True：包含虹膜关键点（iris）
 face_mesh = mp_face_mesh.FaceMesh(
     static_image_mode=True,
+    refine_landmarks=True,
     max_num_faces=1,
-    refine_landmarks=True,  # 使用虹膜关键点
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
+    min_detection_confidence=0.5
 )
 
-# 九宫格标签顺序（固定映射）
-GRID_LABELS: List[str] = [
-    "up_left", "up_center", "up_right",
-    "mid_left", "mid_center", "mid_right",
-    "down_left", "down_center", "down_right",
+# 9 个标准方向 + 对应 B 区 slot 名称
+DIRECTION_TO_SLOT = {
+    "up_left": "up_left",
+    "up": "up",
+    "up_right": "up_right",
+    "left": "left",
+    "center": "center",
+    "right": "right",
+    "down_left": "down_left",
+    "down": "down",
+    "down_right": "down_right",
+}
+
+SLOT_ORDER = [
+    "up_left", "up", "up_right",
+    "left", "center", "right",
+    "down_left", "down", "down_right",
 ]
 
 
-# ----------------- 工具函数 -----------------
-
-
-def file_to_bgr_image(file_storage) -> np.ndarray:
-    """将上传的文件对象转换为 OpenCV BGR 图像。"""
-    data = file_storage.read()
-    np_arr = np.frombuffer(data, np.uint8)
-    img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("无法解码为图像")
-    return img
-
-
-def image_to_base64_png(img_bgr: np.ndarray) -> str:
-    """将 BGR 图像编码为 PNG 的 base64 字符串。"""
-    ok, buf = cv2.imencode(".png", img_bgr)
-    if not ok:
-        raise ValueError("PNG 编码失败")
-    return base64.b64encode(buf.tobytes()).decode("ascii")
-
-
-# ----------------- 视线方向分类（新版） -----------------
-
-
-def classify_gaze_single(img_bgr: np.ndarray, face_mesh) -> Optional[str]:
+# -------------------------
+# 工具函数：从 FaceMesh 提取关键点
+# -------------------------
+def _landmarks_to_np_array(landmarks, image_width: int, image_height: int) -> np.ndarray:
     """
-    使用 MediaPipe FaceMesh 粗略判断注视方向，返回 GRID_LABELS 中的一个或 None。
-    分别对左右眼做归一化，然后取平均值来判断左右 / 上下。
+    将 mediapipe 的 normalized landmark 转成 (N, 2) 像素坐标数组。
     """
-    try:
-        h, w = img_bgr.shape[:2]
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pts = []
+    for lm in landmarks:
+        x = lm.x * image_width
+        y = lm.y * image_height
+        pts.append((x, y))
+    return np.array(pts, dtype=np.float32)
 
-        results = face_mesh.process(img_rgb)
-        if not results.multi_face_landmarks:
-            return None
 
-        face_landmarks = results.multi_face_landmarks[0]
+def _get_eye_iris_centers(landmarks_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    粗略计算左右眼、左右虹膜的中心点。
 
-        # 关键点索引（MediaPipe FaceMesh + iris）
-        left_eye_idx = [33, 133, 160, 159, 158, 157, 173, 246]
-        right_eye_idx = [362, 263, 387, 386, 385, 384, 398, 466]
-        left_iris_idx = [474, 475, 476, 477]
-        right_iris_idx = [469, 470, 471, 472]
+    FaceMesh 索引说明（基于 mediapipe 官方图）：
+    - 左眼虹膜：468~471
+    - 右眼虹膜：473~476
+    - 左眼轮廓（大致）：[33, 133, 159, 145]
+    - 右眼轮廓（大致）：[362, 263, 386, 374]
+    """
+    iris_left_idx = [468, 469, 470, 471]
+    iris_right_idx = [473, 474, 475, 476]
+    eye_left_idx = [33, 133, 159, 145]
+    eye_right_idx = [362, 263, 386, 374]
 
-        def landmark_xy(idx_list):
-            xs, ys = [], []
-            for idx in idx_list:
-                lm = face_landmarks.landmark[idx]
-                xs.append(lm.x * w)
-                ys.append(lm.y * h)
-            return np.array(xs), np.array(ys)
+    iris_left = landmarks_np[iris_left_idx, :]
+    iris_right = landmarks_np[iris_right_idx, :]
+    eye_left = landmarks_np[eye_left_idx, :]
+    eye_right = landmarks_np[eye_right_idx, :]
 
-        # 左右眼轮廓
-        l_ex, l_ey = landmark_xy(left_eye_idx)
-        r_ex, r_ey = landmark_xy(right_eye_idx)
-        # 左右眼虹膜点
-        l_ix, l_iy = landmark_xy(left_iris_idx)
-        r_ix, r_iy = landmark_xy(right_iris_idx)
+    iris_left_center = iris_left.mean(axis=0)
+    iris_right_center = iris_right.mean(axis=0)
+    eye_left_center = eye_left.mean(axis=0)
+    eye_right_center = eye_right.mean(axis=0)
 
-        eps = 1e-6
+    return (iris_left_center, eye_left_center), (iris_right_center, eye_right_center)
 
-        def norm_pos(iris_xs, iris_ys, eye_xs, eye_ys):
-            eye_min_x, eye_max_x = eye_xs.min(), eye_xs.max()
-            eye_min_y, eye_max_y = eye_ys.min(), eye_ys.max()
-            cx, cy = float(np.mean(iris_xs)), float(np.mean(iris_ys))
-            x_n = (cx - eye_min_x) / (eye_max_x - eye_min_x + eps)
-            y_n = (cy - eye_min_y) / (eye_max_y - eye_min_y + eps)
-            return x_n, y_n
 
-        # 分别计算左右眼的归一化位置，然后取平均
-        lx_n, ly_n = norm_pos(l_ix, l_iy, l_ex, l_ey)
-        rx_n, ry_n = norm_pos(r_ix, r_iy, r_ex, r_ey)
+def _estimate_gaze_direction(
+        iris_left: np.ndarray,
+        eye_left_center: np.ndarray,
+        iris_right: np.ndarray,
+        eye_right_center: np.ndarray,
+        eye_left_box: Tuple[float, float],
+        eye_right_box: Tuple[float, float],
+        tx: float = 0.25,
+        ty: float = 0.25,
+) -> str:
+    """
+    按文档 2.4 的公式做视线方向判定：
+      dx = (pupil_x - eye_center_x) / eye_width
+      dy = (pupil_y - eye_center_y) / eye_height
 
-        x_norm = (lx_n + rx_n) / 2.0
-        y_norm = (ly_n + ry_n) / 2.0
+    这里左右眼各算一遍，然后取平均 dx, dy 再做 9 宫格分类。
+    """
+    # 左眼
+    eye_left_w, eye_left_h = eye_left_box
+    dx_left = (iris_left[0] - eye_left_center[0]) / max(eye_left_w, 1e-5)
+    dy_left = (iris_left[1] - eye_left_center[1]) / max(eye_left_h, 1e-5)
 
-        # ------- 左 / 右 判定 -------
-        if x_norm < 0.40:
-            horiz = "left"
-        elif x_norm > 0.60:
-            horiz = "right"
-        else:
-            horiz = "center"
+    # 右眼
+    eye_right_w, eye_right_h = eye_right_box
+    dx_right = (iris_right[0] - eye_right_center[0]) / max(eye_right_w, 1e-5)
+    dy_right = (iris_right[1] - eye_right_center[1]) / max(eye_right_h, 1e-5)
 
-        # ------- 上 / 下 判定 -------
-        if y_norm < 0.45:
-            vert = "up"
-        elif y_norm > 0.55:
-            vert = "down"
-        else:
-            vert = "mid"
+    dx = (dx_left + dx_right) / 2.0
+    dy = (dy_left + dy_right) / 2.0
 
-        label_map = {
-            ("up", "left"): "up_left",
-            ("up", "center"): "up_center",
-            ("up", "right"): "up_right",
-            ("mid", "left"): "mid_left",
-            ("mid", "center"): "mid_center",
-            ("mid", "right"): "mid_right",
-            ("down", "left"): "down_left",
-            ("down", "center"): "down_center",
-            ("down", "right"): "down_right",
+    # 水平方向
+    if dx <= -tx:
+        horiz = "left"
+    elif dx >= tx:
+        horiz = "right"
+    else:
+        horiz = "center"
+
+    # 垂直方向（注意图像坐标 y 向下增加）
+    if dy <= -ty:
+        vert = "up"
+    elif dy >= ty:
+        vert = "down"
+    else:
+        vert = "center"
+
+    direction = f"{vert}_{horiz}"
+    # 特殊处理“center_center”
+    if direction == "center_center":
+        direction = "center"
+
+    # 映射到 9 宫格标准名称
+    if direction == "up_left":
+        return "up_left"
+    if direction == "up_right":
+        return "up_right"
+    if direction == "down_left":
+        return "down_left"
+    if direction == "down_right":
+        return "down_right"
+    if direction == "up_center":
+        return "up"
+    if direction == "center_left":
+        return "left"
+    if direction == "center_right":
+        return "right"
+    if direction == "down_center":
+        return "down"
+    if direction == "center":
+        return "center"
+
+    # 兜底：当做 center
+    return "center"
+
+
+def _get_eye_boxes(landmarks_np: np.ndarray) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    粗略计算左右眼的宽高（像素）。
+    用于归一化 dx、dy。
+    """
+    left_idx = [33, 133, 159, 145]
+    right_idx = [362, 263, 386, 374]
+
+    left_pts = landmarks_np[left_idx, :]
+    right_pts = landmarks_np[right_idx, :]
+
+    left_x_min, left_y_min = left_pts.min(axis=0)
+    left_x_max, left_y_max = left_pts.max(axis=0)
+    right_x_min, right_y_min = right_pts.min(axis=0)
+    right_x_max, right_y_max = right_pts.max(axis=0)
+
+    left_w = left_x_max - left_x_min
+    left_h = left_y_max - left_y_min
+    right_w = right_x_max - right_x_min
+    right_h = right_y_max - right_y_min
+
+    return (float(left_w), float(left_h)), (float(right_w), float(right_h))
+
+
+# -------------------------
+# 工具函数：根据双眼裁剪 2:1 眼区
+# -------------------------
+def crop_eye_region_2to1(
+        image: Image.Image,
+        iris_left_center: np.ndarray,
+        iris_right_center: np.ndarray,
+) -> Image.Image:
+    """
+    按文档要求的“2:1 裁剪”：以双眼中点为中心，生成宽:高 = 2:1 的矩形。
+    """
+    w, h = image.size
+
+    cx = float((iris_left_center[0] + iris_right_center[0]) / 2.0)
+    cy = float((iris_left_center[1] + iris_right_center[1]) / 2.0)
+
+    eye_dist = float(np.linalg.norm(iris_right_center - iris_left_center))
+    if eye_dist <= 1e-3:
+        eye_dist = min(w, h) / 5.0
+
+    box_width = eye_dist * 2.5
+    box_height = box_width / 2.0  # 2:1
+
+    top = cy - box_height * 0.55
+    bottom = top + box_height
+    left = cx - box_width / 2.0
+    right = left + box_width
+
+    left = max(0, left)
+    top = max(0, top)
+    right = min(w, right)
+    bottom = min(h, bottom)
+
+    if right - left <= 0 or bottom - top <= 0:
+        return image.copy()
+
+    return image.crop((left, top, right, bottom))
+
+
+# -------------------------
+# 主处理函数：单张图 -> 方向 + 裁剪图
+# -------------------------
+def process_single_image(pil_img: Image.Image) -> Dict:
+    """
+    对单张图片执行：
+    - EXIF 方向矫正
+    - FaceMesh 检测关键点
+    - 根据虹膜 & 眼眶计算眼区裁剪 2:1
+    - 根据 pupil/eye_center + Tx/Ty 计算 9 宫格方向
+    """
+    pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+    w, h = pil_img.size
+
+    img_np = np.array(pil_img)
+    results = face_mesh.process(img_np)
+
+    if not results.multi_face_landmarks:
+        return {
+            "direction": "center",
+            "cropped_image": pil_img
         }
 
-        label = label_map.get((vert, horiz))
-        return label
-    except Exception as e:
-        logger.warning("classify_gaze_single 异常: %s", e)
-        return None
+    landmarks = results.multi_face_landmarks[0].landmark
+    landmarks_np = _landmarks_to_np_array(landmarks, w, h)
+
+    (iris_left_center, eye_left_center), (iris_right_center, eye_right_center) = \
+        _get_eye_iris_centers(landmarks_np)
+
+    eye_left_box, eye_right_box = _get_eye_boxes(landmarks_np)
+
+    direction = _estimate_gaze_direction(
+        iris_left_center,
+        eye_left_center,
+        iris_right_center,
+        eye_right_center,
+        eye_left_box,
+        eye_right_box,
+        tx=0.25,
+        ty=0.25,
+    )
+
+    cropped = crop_eye_region_2to1(pil_img, iris_left_center, iris_right_center)
+
+    return {
+        "direction": direction,
+        "cropped_image": cropped
+    }
 
 
-# ----------------- Flask 路由 -----------------
-
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
-
-
+# -------------------------
+# /process_images 路由
+# -------------------------
 @app.route("/process_images", methods=["POST"])
 def process_images():
-    """
-    接收 9 张图片：
-      - Content-Type: multipart/form-data
-      - 字段名: images（可以是多个）
+    content_type = request.content_type
+    logger.info("Content-Type from client: %s", content_type)
 
-    返回（兼容前端）：
-      {
-        "status": "ok",
-        "results": [               # ✅ 前端主要使用这个
-          {
-            "original_index": 0,
-            "label": "mid_center",
-            "image_base64": "...."
-          },
-          ...
-        ],
-        "sorted_indices": [...],   # 可选调试字段
-        "sorted_labels":  [...],
-        "errors": [...]
-      }
-    """
-    try:
-        logger.info("Content-Type from client: %s", request.content_type)
+    if "images" not in request.files:
+        return jsonify({"error": "No 'images' field in form-data."}), 400
 
-        if "images" not in request.files:
-            return (
-                jsonify(
-                    {
-                        "status": "error",
-                        "message": "未找到字段 'images'",
-                        "results": [],
-                        "errors": [{"error": "no_images_field"}],
-                    }
-                ),
-                400,
-            )
+    files = request.files.getlist("images")
+    logger.info("request.files keys: %s", list(request.files.keys()))
+    logger.info("Parsed %d images from request", len(files))
 
-        files = request.files.getlist("images")
-        logger.info("request.files keys: %s", list(request.files.keys()))
-        logger.info("Parsed %d images from request", len(files))
+    files = files[:9]
 
-        # 原始结果列表（未排序）
-        raw_results = []
-        errors = []
+    # 1. 逐张处理：方向 + 裁剪图
+    processed_items: List[Dict] = []
+    for idx, file in enumerate(files):
+        filename = secure_filename(file.filename) or f"image_{idx}.jpg"
+        try:
+            pil_img = Image.open(io.BytesIO(file.read()))
+        except Exception:
+            logger.exception("读取图片失败：%s", filename)
+            continue
 
-        for idx, fs in enumerate(files):
+        result = process_single_image(pil_img)
+        direction = result["direction"]
+        cropped = result["cropped_image"]
+
+        logger.info("图像 %d 分类结果: %s", idx, direction)
+
+        processed_items.append({
+            "original_index": idx,
+            "filename": filename,
+            "direction": direction,
+            "cropped_image": cropped
+        })
+
+    if not processed_items:
+        return jsonify({"error": "No valid images processed."}), 400
+
+    # 2. 先按 direction 填充 slot（每种方向取第一张）
+    slot_to_item: Dict[str, Optional[Dict]] = {s: None for s in SLOT_ORDER}
+
+    for item in processed_items:
+        dir_name = item["direction"]
+        slot = DIRECTION_TO_SLOT.get(dir_name, "center")
+        if slot_to_item[slot] is None:
+            slot_to_item[slot] = item
+
+    # 3. 用剩余的图片补齐所有空的 slot，保证尽量 9 个格子都被占用，
+    #    并且每张图片最多只用一次。
+    used_indices = {
+        v["original_index"] for v in slot_to_item.values() if v is not None
+    }
+    remaining_items = [
+        item for item in processed_items
+        if item["original_index"] not in used_indices
+    ]
+    remaining_iter = iter(remaining_items)
+
+    for slot in SLOT_ORDER:
+        if slot_to_item[slot] is None:
             try:
-                img_bgr = file_to_bgr_image(fs)
-                label = classify_gaze_single(img_bgr, face_mesh)
-                logger.info("图像 %d 分类结果: %s", idx, label)
+                slot_to_item[slot] = next(remaining_iter)
+            except StopIteration:
+                # 图片数量 < 9，或有几张检测失败，就允许少于 9 格
+                break
 
-                img_b64 = image_to_base64_png(img_bgr)
-                raw_results.append(
-                    {
-                        "original_index": idx,
-                        "label": label,
-                        "image_base64": img_b64,
-                    }
-                )
-            except Exception as e:
-                logger.exception("处理第 %d 张图片异常", idx)
-                errors.append({"index": idx, "error": str(e)})
+    # 4. 构造返回给前端的结果
+    grid_order: List[int] = []
+    results_for_frontend: List[Dict] = []
 
-        # 根据 label 做九宫格排序
-        label_to_pos = {label: i for i, label in enumerate(GRID_LABELS)}
+    for slot in SLOT_ORDER:
+        item = slot_to_item.get(slot)
+        if item is None:
+            grid_order.append(-1)
+            continue
 
-        def sort_key(i: int) -> int:
-            label = raw_results[i]["label"]
-            return label_to_pos.get(label, 999)
+        original_index = item["original_index"]
+        grid_order.append(original_index)
 
-        # raw_results 的下标列表
-        sorted_result_indices = sorted(range(len(raw_results)), key=sort_key)
+        buf = io.BytesIO()
+        item["cropped_image"].save(buf, format="JPEG", quality=95)
+        img_bytes = buf.getvalue()
+        img_b64 = base64.b64encode(img_bytes).decode("utf-8")
 
-        # 按九宫格顺序重排结果，供前端使用
-        sorted_results = [raw_results[i] for i in sorted_result_indices]
+        results_for_frontend.append({
+            "slot": slot,
+            "image_base64": img_b64
+        })
 
-        sorted_indices = [r["original_index"] for r in sorted_results]
-        sorted_labels = [r["label"] for r in sorted_results]
-
-        logger.info("九宫格排序结果(位置->原始索引): %s", sorted_indices)
-        logger.info("Return %d results, %d errors", len(sorted_results), len(errors))
-
-        return jsonify(
-            {
-                "status": "ok",
-                # ✅ 兼容前端：results[].image_base64
-                "results": sorted_results,
-                # 额外调试字段
-                "sorted_indices": sorted_indices,
-                "sorted_labels": sorted_labels,
-                "errors": errors,
-            }
+    logger.info("九宫格排序结果(位置->原始索引): %s", grid_order)
+    logger.info(
+        "Return %d results, %d errors",
+        len(results_for_frontend),
+        len(files) - len(processed_items),
         )
 
-    except Exception as e:
-        logger.exception("顶层 /process_images 异常")
-        return (
-            jsonify(
-                {
-                    "status": "error",
-                    "message": f"服务器异常: {e}",
-                    "results": [],
-                    "errors": [{"error": str(e)}],
-                }
-            ),
-            500,
-        )
+    return jsonify({"results": results_for_frontend})
 
-
-# ----------------- 主入口 -----------------
 
 if __name__ == "__main__":
-    # 绑定 0.0.0.0 方便手机访问
     app.run(host="0.0.0.0", port=8000, debug=True)
