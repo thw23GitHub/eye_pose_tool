@@ -17,7 +17,6 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("app")
 
-
 # -------------------------
 # MediaPipe FaceMesh 初始化
 # -------------------------
@@ -45,20 +44,18 @@ DIRECTION_TO_SLOT = {
     "down_right": "down_right",
 }
 
+# 这里的顺序是「从左上到右下」的九宫格顺序
 SLOT_ORDER = [
     "up_left", "up", "up_right",
     "left", "center", "right",
     "down_left", "down", "down_right",
 ]
 
-
 # -------------------------
 # 工具函数：从 FaceMesh 提取关键点
 # -------------------------
 def _landmarks_to_np_array(landmarks, image_width: int, image_height: int) -> np.ndarray:
-    """
-    将 mediapipe 的 normalized landmark 转成 (N, 2) 像素坐标数组。
-    """
+    """将 mediapipe 的 normalized landmark 转成 (N, 2) 像素坐标数组。"""
     pts = []
     for lm in landmarks:
         x = lm.x * image_width
@@ -95,6 +92,29 @@ def _get_eye_iris_centers(landmarks_np: np.ndarray) -> Tuple[np.ndarray, np.ndar
     return (iris_left_center, eye_left_center), (iris_right_center, eye_right_center)
 
 
+def _get_eye_boxes(landmarks_np: np.ndarray) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """
+    粗略计算左右眼的宽高（像素），用于归一化 dx、dy。
+    """
+    left_idx = [33, 133, 159, 145]
+    right_idx = [362, 263, 386, 374]
+
+    left_pts = landmarks_np[left_idx, :]
+    right_pts = landmarks_np[right_idx, :]
+
+    left_x_min, left_y_min = left_pts.min(axis=0)
+    left_x_max, left_y_max = left_pts.max(axis=0)
+    right_x_min, right_y_min = right_pts.min(axis=0)
+    right_x_max, right_y_max = right_pts.max(axis=0)
+
+    left_w = left_x_max - left_x_min
+    left_h = left_y_max - left_y_min
+    right_w = right_x_max - right_x_min
+    right_h = right_y_max - right_y_min
+
+    return (float(left_w), float(left_h)), (float(right_w), float(right_h))
+
+
 def _estimate_gaze_direction(
         iris_left: np.ndarray,
         eye_left_center: np.ndarray,
@@ -109,8 +129,6 @@ def _estimate_gaze_direction(
     按文档 2.4 的公式做视线方向判定：
       dx = (pupil_x - eye_center_x) / eye_width
       dy = (pupil_y - eye_center_y) / eye_height
-
-    这里左右眼各算一遍，然后取平均 dx, dy 再做 9 宫格分类。
     """
     # 左眼
     eye_left_w, eye_left_h = eye_left_box
@@ -142,11 +160,10 @@ def _estimate_gaze_direction(
         vert = "center"
 
     direction = f"{vert}_{horiz}"
-    # 特殊处理“center_center”
     if direction == "center_center":
         direction = "center"
 
-    # 映射到 9 宫格标准名称
+    # 映射到 9 宫格名称
     if direction == "up_left":
         return "up_left"
     if direction == "up_right":
@@ -166,68 +183,73 @@ def _estimate_gaze_direction(
     if direction == "center":
         return "center"
 
-    # 兜底：当做 center
+    # 兜底
     return "center"
 
 
-def _get_eye_boxes(landmarks_np: np.ndarray) -> Tuple[Tuple[float, float], Tuple[float, float]]:
-    """
-    粗略计算左右眼的宽高（像素）。
-    用于归一化 dx、dy。
-    """
-    left_idx = [33, 133, 159, 145]
-    right_idx = [362, 263, 386, 374]
-
-    left_pts = landmarks_np[left_idx, :]
-    right_pts = landmarks_np[right_idx, :]
-
-    left_x_min, left_y_min = left_pts.min(axis=0)
-    left_x_max, left_y_max = left_pts.max(axis=0)
-    right_x_min, right_y_min = right_pts.min(axis=0)
-    right_x_max, right_y_max = right_pts.max(axis=0)
-
-    left_w = left_x_max - left_x_min
-    left_h = left_y_max - left_y_min
-    right_w = right_x_max - right_x_min
-    right_h = right_y_max - right_y_min
-
-    return (float(left_w), float(left_h)), (float(right_w), float(right_h))
-
-
 # -------------------------
-# 工具函数：根据双眼裁剪 2:1 眼区
+# 新：根据整张脸裁剪 2:1 区域（左脸庞到右脸庞）
 # -------------------------
-def crop_eye_region_2to1(
+def crop_face_region_2to1(
         image: Image.Image,
+        landmarks_np: np.ndarray,
         iris_left_center: np.ndarray,
         iris_right_center: np.ndarray,
 ) -> Image.Image:
     """
-    按文档要求的“2:1 裁剪”：以双眼中点为中心，生成宽:高 = 2:1 的矩形。
+    按文档要求：
+    - 水平方向：基本覆盖从左脸庞到右脸庞（用所有 landmarks 的 min/max）
+    - 宽高比：2:1（宽:高）
+    - 眼睛略偏上（不是严格居中）
     """
     w, h = image.size
 
-    cx = float((iris_left_center[0] + iris_right_center[0]) / 2.0)
-    cy = float((iris_left_center[1] + iris_right_center[1]) / 2.0)
+    # 1. 用所有 landmark 估计“脸”的左右边界
+    x_min = float(landmarks_np[:, 0].min())
+    x_max = float(landmarks_np[:, 0].max())
+    face_width = max(x_max - x_min, 1.0)
 
-    eye_dist = float(np.linalg.norm(iris_right_center - iris_left_center))
-    if eye_dist <= 1e-3:
-        eye_dist = min(w, h) / 5.0
+    # 略加一点 margin，避免剪得太紧
+    margin_scale = 1.10
+    box_width = min(face_width * margin_scale, float(w))
+    box_height = box_width / 2.0  # 严格 2:1
 
-    box_width = eye_dist * 2.5
-    box_height = box_width / 2.0  # 2:1
+    # 2. 水平中心：左右边界中点
+    cx = (x_min + x_max) / 2.0
 
-    top = cy - box_height * 0.55
+    # 3. 垂直中心：用双眼中点，让眼睛稍微偏上
+    cy_eyes = float((iris_left_center[1] + iris_right_center[1]) / 2.0)
+    # 让眼睛在裁剪框的略上方（例如 0.45 高度处）
+    top = cy_eyes - box_height * 0.45
     bottom = top + box_height
     left = cx - box_width / 2.0
     right = left + box_width
 
-    left = max(0, left)
-    top = max(0, top)
-    right = min(w, right)
-    bottom = min(h, bottom)
+    # 4. 边界处理（尽量保持 2:1 不变，只平移）
+    # 水平
+    if left < 0:
+        right -= left  # 向右平移
+        left = 0
+    if right > w:
+        shift = right - w
+        left -= shift
+        right = w
+    left = max(0.0, left)
+    right = min(float(w), right)
 
-    if right - left <= 0 or bottom - top <= 0:
+    # 垂直
+    if top < 0:
+        bottom -= top
+        top = 0
+    if bottom > h:
+        shift = bottom - h
+        top -= shift
+        bottom = h
+    top = max(0.0, top)
+    bottom = min(float(h), bottom)
+
+    # 兜底：如果计算出非法区域，就退回整图
+    if right - left <= 1 or bottom - top <= 1:
         return image.copy()
 
     return image.crop((left, top, right, bottom))
@@ -241,7 +263,7 @@ def process_single_image(pil_img: Image.Image) -> Dict:
     对单张图片执行：
     - EXIF 方向矫正
     - FaceMesh 检测关键点
-    - 根据虹膜 & 眼眶计算眼区裁剪 2:1
+    - 根据整张脸计算 2:1 裁剪（左脸庞到右脸庞）
     - 根据 pupil/eye_center + Tx/Ty 计算 9 宫格方向
     """
     pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
@@ -251,6 +273,7 @@ def process_single_image(pil_img: Image.Image) -> Dict:
     results = face_mesh.process(img_np)
 
     if not results.multi_face_landmarks:
+        # 没检测到脸：直接使用整图 + 默认 center
         return {
             "direction": "center",
             "cropped_image": pil_img
@@ -259,11 +282,14 @@ def process_single_image(pil_img: Image.Image) -> Dict:
     landmarks = results.multi_face_landmarks[0].landmark
     landmarks_np = _landmarks_to_np_array(landmarks, w, h)
 
+    # 获取左右眼+虹膜中心
     (iris_left_center, eye_left_center), (iris_right_center, eye_right_center) = \
         _get_eye_iris_centers(landmarks_np)
 
+    # 眼睛 bbox（宽高）
     eye_left_box, eye_right_box = _get_eye_boxes(landmarks_np)
 
+    # 方向判定
     direction = _estimate_gaze_direction(
         iris_left_center,
         eye_left_center,
@@ -275,7 +301,13 @@ def process_single_image(pil_img: Image.Image) -> Dict:
         ty=0.25,
     )
 
-    cropped = crop_eye_region_2to1(pil_img, iris_left_center, iris_right_center)
+    # 2:1 脸部裁剪（从左脸庞到右脸庞）
+    cropped = crop_face_region_2to1(
+        pil_img,
+        landmarks_np,
+        iris_left_center,
+        iris_right_center
+    )
 
     return {
         "direction": direction,
@@ -288,6 +320,23 @@ def process_single_image(pil_img: Image.Image) -> Dict:
 # -------------------------
 @app.route("/process_images", methods=["POST"])
 def process_images():
+    """
+    接口说明：
+    - 输入：multipart/form-data，字段名 'images'，最多 9 张
+    - 后端：
+        1) 对每张图做脸部 2:1 裁剪 + 视线方向判定
+        2) 按 9 宫格方向填入固定 slot
+    - 输出 JSON:
+      {
+        "results": [
+          {
+            "slot": "up_left" | "up" | ... | "down_right",
+            "image_base64": "<...>"
+          },
+          ...
+        ]
+      }
+    """
     content_type = request.content_type
     logger.info("Content-Type from client: %s", content_type)
 
@@ -298,10 +347,11 @@ def process_images():
     logger.info("request.files keys: %s", list(request.files.keys()))
     logger.info("Parsed %d images from request", len(files))
 
+    # 最多 9 张
     files = files[:9]
 
-    # 1. 逐张处理：方向 + 裁剪图
-    processed_items: List[Dict] = []
+    processed_items: List[dict] = []
+
     for idx, file in enumerate(files):
         filename = secure_filename(file.filename) or f"image_{idx}.jpg"
         try:
@@ -323,11 +373,8 @@ def process_images():
             "cropped_image": cropped
         })
 
-    if not processed_items:
-        return jsonify({"error": "No valid images processed."}), 400
-
-    # 2. 先按 direction 填充 slot（每种方向取第一张）
-    slot_to_item: Dict[str, Optional[Dict]] = {s: None for s in SLOT_ORDER}
+    # 构建九宫格布局：slot -> 使用哪一张图（original_index）
+    slot_to_item: Dict[str, Optional[dict]] = {s: None for s in SLOT_ORDER}
 
     for item in processed_items:
         dir_name = item["direction"]
@@ -335,31 +382,11 @@ def process_images():
         if slot_to_item[slot] is None:
             slot_to_item[slot] = item
 
-    # 3. 用剩余的图片补齐所有空的 slot，保证尽量 9 个格子都被占用，
-    #    并且每张图片最多只用一次。
-    used_indices = {
-        v["original_index"] for v in slot_to_item.values() if v is not None
-    }
-    remaining_items = [
-        item for item in processed_items
-        if item["original_index"] not in used_indices
-    ]
-    remaining_iter = iter(remaining_items)
-
-    for slot in SLOT_ORDER:
-        if slot_to_item[slot] is None:
-            try:
-                slot_to_item[slot] = next(remaining_iter)
-            except StopIteration:
-                # 图片数量 < 9，或有几张检测失败，就允许少于 9 格
-                break
-
-    # 4. 构造返回给前端的结果
     grid_order: List[int] = []
     results_for_frontend: List[Dict] = []
 
     for slot in SLOT_ORDER:
-        item = slot_to_item.get(slot)
+        item = slot_to_item[slot]
         if item is None:
             grid_order.append(-1)
             continue
@@ -381,8 +408,8 @@ def process_images():
     logger.info(
         "Return %d results, %d errors",
         len(results_for_frontend),
-        len(files) - len(processed_items),
-        )
+        len(files) - len(processed_items)
+    )
 
     return jsonify({"results": results_for_frontend})
 
