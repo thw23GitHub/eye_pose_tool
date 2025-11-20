@@ -43,3 +43,5 @@ app.*.map.json
 /android/app/debug
 /android/app/profile
 /android/app/release
+backend_flask/venv310/
+backend_flask/static/crops/

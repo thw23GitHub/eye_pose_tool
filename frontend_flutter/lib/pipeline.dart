@@ -124,3 +124,5 @@ im.Image _makeMosaic(List<im.Image> tiles) {
 
   return mosaic;
 }
+
+//test, hello ShiChuan
